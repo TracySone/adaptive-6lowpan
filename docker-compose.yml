@@ -1,0 +1,17 @@
+services:
+  host:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    working_dir: /workspace
+    command: ["bash", "-lc", "make test && ./build/adaptive_demo --steps 24"]
+
+  contiki:
+    build:
+      context: .
+      dockerfile: docker/contiki.Dockerfile
+    working_dir: /workspace/platform/contiki-ng
+    command:
+      - bash
+      - -lc
+      - make CONTIKI=/opt/contiki-ng TARGET=native
