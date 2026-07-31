@@ -15,7 +15,6 @@ GOOD -> NORMAL -> DEGRADED -> CONGESTED -> RECOVERY
 
 | Module | Files | Responsibility |
 | --- | --- | --- |
-| Parameter normalization | `metrics.c` | EWMA baseline and direction-aware z-scores |
 | Dynamic five-state HMM | `hmm.c` | Gaussian emissions, online soft-EM, learned transition matrix and recovery hysteresis |
 | Daubechies compression | `wavelet_db4.c`, `codec.c` | Multilevel db4 DWT, MAD noise estimate, adaptive soft threshold, quantization and sparse encoding |
 | CoAP Block1 | `coap_block.c` | RFC 7252 packet encoding/parsing and RFC 7959 Block1/Size1 options |
