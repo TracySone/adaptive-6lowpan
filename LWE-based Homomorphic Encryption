@@ -1,0 +1,322 @@
+#!/usr/bin/env python3
+"""Bit-exact latency/energy accounting for the DA-AHE reporting path.
+
+The script separates four quantities that must not be mixed in the paper:
+1. MCU processing cost;
+2. source-node serialization/TX cost;
+3. multi-hop network TX/RX cost; and
+4. batch-level shared-channel occupancy.
+
+Only Python's standard library is required.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import math
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any
+
+
+@dataclass(frozen=True)
+class CryptoConfig:
+    module_rank: int = 3
+    ring_degree: int = 256
+    modulus_bits: int = 32
+    ciphertext_components: int = 2  # base ciphertext + encrypted linear-MAC
+    envelope_overhead_bytes: int = 0  # IDs, nonces, profiles, tags, etc.
+
+    @property
+    def single_ciphertext_bytes(self) -> int:
+        bits = (self.module_rank + 1) * self.ring_degree * self.modulus_bits
+        return math.ceil(bits / 8)
+
+    @property
+    def hve_body_bytes(self) -> int:
+        return self.ciphertext_components * self.single_ciphertext_bytes
+
+    @property
+    def envelope_bytes(self) -> int:
+        return self.hve_body_bytes + self.envelope_overhead_bytes
+
+
+@dataclass(frozen=True)
+class NetworkConfig:
+    bitrate_bps: float = 100_000.0
+    voltage_v: float = 3.0
+    tx_current_a: float = 17.4e-3
+    rx_current_a: float = 18.8e-3
+    coap_block_payload_bytes: int = 512
+    phy_frame_bytes: int = 127
+    mac_overhead_bytes: int = 25
+    compressed_network_header_bytes: int = 20
+    frag1_header_bytes: int = 4
+    fragn_header_bytes: int = 5
+    hop_count: int = 1
+    retransmission_factor: float = 1.0
+
+
+@dataclass(frozen=True)
+class WorkloadConfig:
+    sensitive_path_probability: float = 0.30
+    mcu_latency_ms: float = 68.25
+    mcu_energy_mj: float = 1.522
+    plain_envelope_bytes: int = 0
+
+
+@dataclass(frozen=True)
+class Profile:
+    name: str
+    sigma_enc: float
+    n_max: int
+
+
+PROFILES = (
+    Profile("Pi_0", 3.2, 16),
+    Profile("Pi_1", 3.4, 14),
+    Profile("Pi_2", 3.6, 12),
+)
+
+
+def _positive(name: str, value: float) -> None:
+    if value <= 0:
+        raise ValueError(f"{name} must be positive; got {value}")
+
+
+def _probability(name: str, value: float) -> None:
+    if not 0.0 <= value <= 1.0:
+        raise ValueError(f"{name} must lie in [0,1]; got {value}")
+
+
+def coap_blocks(payload_bytes: int, block_payload_bytes: int) -> list[int]:
+    """Return the application payload carried by each CoAP block."""
+    if payload_bytes == 0:
+        return []
+    return [
+        min(block_payload_bytes, payload_bytes - offset)
+        for offset in range(0, payload_bytes, block_payload_bytes)
+    ]
+
+
+def link_bytes_for_datagram(datagram_bytes: int, net: NetworkConfig) -> tuple[int, int]:
+    """Return (on-air bytes, frame count) under a simplified 6LoWPAN model."""
+    unfragmented_capacity = net.phy_frame_bytes - net.mac_overhead_bytes
+    if datagram_bytes <= unfragmented_capacity:
+        return net.mac_overhead_bytes + datagram_bytes, 1
+
+    first_capacity = net.phy_frame_bytes - net.mac_overhead_bytes - net.frag1_header_bytes
+    next_capacity = net.phy_frame_bytes - net.mac_overhead_bytes - net.fragn_header_bytes
+    if first_capacity <= 0 or next_capacity <= 0:
+        raise ValueError("Configured headers leave no IEEE 802.15.4 payload capacity")
+
+    first_payload = min(first_capacity, datagram_bytes)
+    total_link_bytes = net.mac_overhead_bytes + net.frag1_header_bytes + first_payload
+    frames = 1
+    remaining = datagram_bytes - first_payload
+    while remaining > 0:
+        chunk = min(next_capacity, remaining)
+        total_link_bytes += net.mac_overhead_bytes + net.fragn_header_bytes + chunk
+        frames += 1
+        remaining -= chunk
+    return total_link_bytes, frames
+
+
+def packetize(payload_bytes: int, net: NetworkConfig) -> dict[str, int]:
+    """Account for CoAP blocks and IEEE 802.15.4/6LoWPAN frames."""
+    total_on_air_bytes = 0
+    total_frames = 0
+    blocks = coap_blocks(payload_bytes, net.coap_block_payload_bytes)
+    for block_payload in blocks:
+        datagram_bytes = block_payload + net.compressed_network_header_bytes
+        on_air_bytes, frames = link_bytes_for_datagram(datagram_bytes, net)
+        total_on_air_bytes += on_air_bytes
+        total_frames += frames
+    return {
+        "coap_blocks": len(blocks),
+        "ieee802154_frames": total_frames,
+        "on_air_bytes_per_hop": total_on_air_bytes,
+    }
+
+
+def airtime_s(byte_count: int, net: NetworkConfig) -> float:
+    return byte_count * 8.0 / net.bitrate_bps * net.retransmission_factor
+
+
+def radio_energy_mj(current_a: float, duration_s: float, net: NetworkConfig) -> float:
+    return net.voltage_v * current_a * duration_s * 1_000.0
+
+
+def evaluate(crypto: CryptoConfig, net: NetworkConfig, load: WorkloadConfig) -> dict[str, Any]:
+    _positive("bitrate_bps", net.bitrate_bps)
+    _positive("hop_count", net.hop_count)
+    _positive("retransmission_factor", net.retransmission_factor)
+    _probability("sensitive_path_probability", load.sensitive_path_probability)
+
+    sensitive_packet = packetize(crypto.envelope_bytes, net)
+    plain_packet = packetize(load.plain_envelope_bytes, net)
+
+    # Ciphertext-body lower bounds deliberately exclude all headers and metadata.
+    body_airtime = crypto.hve_body_bytes * 8.0 / net.bitrate_bps
+    body_tx_energy = radio_energy_mj(net.tx_current_a, body_airtime, net)
+
+    sensitive_airtime = airtime_s(sensitive_packet["on_air_bytes_per_hop"], net)
+    plain_airtime = airtime_s(plain_packet["on_air_bytes_per_hop"], net)
+    sensitive_tx = radio_energy_mj(net.tx_current_a, sensitive_airtime, net)
+    sensitive_rx = radio_energy_mj(net.rx_current_a, sensitive_airtime, net)
+    plain_tx = radio_energy_mj(net.tx_current_a, plain_airtime, net)
+    plain_rx = radio_energy_mj(net.rx_current_a, plain_airtime, net)
+
+    p = load.sensitive_path_probability
+    expected_source_airtime = p * sensitive_airtime + (1.0 - p) * plain_airtime
+    expected_source_tx = p * sensitive_tx + (1.0 - p) * plain_tx
+    expected_network_radio = net.hop_count * (
+        p * (sensitive_tx + sensitive_rx) + (1.0 - p) * (plain_tx + plain_rx)
+    )
+
+    result: dict[str, Any] = {
+        "configuration": {
+            "crypto": asdict(crypto),
+            "network": asdict(net),
+            "workload": asdict(load),
+        },
+        "bit_exact_sizes": {
+            "single_mlwe_ciphertext_bytes": crypto.single_ciphertext_bytes,
+            "two_ciphertext_hve_body_bytes": crypto.hve_body_bytes,
+            "authenticated_envelope_bytes": crypto.envelope_bytes,
+        },
+        "packetization": {
+            "sensitive": sensitive_packet,
+            "plain": plain_packet,
+        },
+        "body_only_analytical_lower_bounds": {
+            "sensitive_serialization_ms": body_airtime * 1_000.0,
+            "sensitive_source_tx_mj": body_tx_energy,
+            "expected_per_node_latency_ms": load.mcu_latency_ms + p * body_airtime * 1_000.0,
+            "expected_per_node_energy_mj": load.mcu_energy_mj + p * body_tx_energy,
+        },
+        "frame_aware_estimates": {
+            "sensitive_source_airtime_ms": sensitive_airtime * 1_000.0,
+            "sensitive_source_tx_mj": sensitive_tx,
+            "sensitive_receiver_rx_mj_per_hop": sensitive_rx,
+            "expected_source_reporting_latency_ms": load.mcu_latency_ms + expected_source_airtime * 1_000.0,
+            "expected_source_energy_mj": load.mcu_energy_mj + expected_source_tx,
+            "expected_network_energy_mj_per_delivered_report": load.mcu_energy_mj + expected_network_radio,
+        },
+        "certified_profiles": [],
+        "scope_notes": [
+            "The 68.25 ms and 1.522 mJ inputs are MCU-side weighted averages.",
+            "The analytical lower bounds omit HVE metadata, headers, RX, forwarding, contention, and retries.",
+            "The frame-aware estimate uses the configured simplified CoAP/6LoWPAN/802.15.4 overhead model.",
+            "Batch airtime is shared-channel occupancy, not a per-node latency measurement.",
+        ],
+    }
+
+    for profile in PROFILES:
+        expected_batch_airtime_ms = profile.n_max * expected_source_airtime * 1_000.0
+        all_sensitive_batch_airtime_ms = profile.n_max * sensitive_airtime * 1_000.0
+        result["certified_profiles"].append(
+            {
+                "profile": profile.name,
+                "sigma_enc": profile.sigma_enc,
+                "n_max": profile.n_max,
+                "expected_shared_channel_airtime_ms": expected_batch_airtime_ms,
+                "all_sensitive_shared_channel_airtime_ms": all_sensitive_batch_airtime_ms,
+                "probability_at_least_one_sensitive_report": 1.0 - (1.0 - p) ** profile.n_max,
+            }
+        )
+    return result
+
+
+def print_report(result: dict[str, Any]) -> None:
+    sizes = result["bit_exact_sizes"]
+    lower = result["body_only_analytical_lower_bounds"]
+    frame = result["frame_aware_estimates"]
+    packet = result["packetization"]["sensitive"]
+
+    print("DA-AHE bit-exact performance report")
+    print(f"  Single M-LWE ciphertext:       {sizes['single_mlwe_ciphertext_bytes']} bytes")
+    print(f"  Two-ciphertext HVE body:       {sizes['two_ciphertext_hve_body_bytes']} bytes")
+    print(f"  Authenticated envelope:        {sizes['authenticated_envelope_bytes']} bytes")
+    print(f"  CoAP blocks / 802.15.4 frames: {packet['coap_blocks']} / {packet['ieee802154_frames']}")
+    print("\nBody-only analytical lower bounds")
+    print(f"  Sensitive serialization:       {lower['sensitive_serialization_ms']:.2f} ms")
+    print(f"  Sensitive source TX energy:    {lower['sensitive_source_tx_mj']:.2f} mJ")
+    print(f"  Expected per-node latency:     {lower['expected_per_node_latency_ms']:.2f} ms")
+    print(f"  Expected per-node energy:      {lower['expected_per_node_energy_mj']:.2f} mJ")
+    print("\nFrame-aware configured estimates")
+    print(f"  Sensitive source airtime:      {frame['sensitive_source_airtime_ms']:.2f} ms")
+    print(f"  Sensitive source TX energy:    {frame['sensitive_source_tx_mj']:.2f} mJ")
+    print(f"  Expected source latency:       {frame['expected_source_reporting_latency_ms']:.2f} ms")
+    print(f"  Expected source energy:        {frame['expected_source_energy_mj']:.2f} mJ")
+    print(f"  Expected network energy:       {frame['expected_network_energy_mj_per_delivered_report']:.2f} mJ/report")
+    print("\nCertified-profile batch occupancy")
+    for row in result["certified_profiles"]:
+        print(
+            f"  {row['profile']}: sigma={row['sigma_enc']:.1f}, Nmax={row['n_max']}, "
+            f"expected={row['expected_shared_channel_airtime_ms']:.2f} ms, "
+            f"all-sensitive={row['all_sensitive_shared_channel_airtime_ms']:.2f} ms"
+        )
+
+
+def write_csv(path: Path, result: dict[str, Any]) -> None:
+    fields = [
+        "profile",
+        "sigma_enc",
+        "n_max",
+        "expected_shared_channel_airtime_ms",
+        "all_sensitive_shared_channel_airtime_ms",
+        "probability_at_least_one_sensitive_report",
+    ]
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(result["certified_profiles"])
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--p-sens", type=float, default=0.30, help="Probability that a node-round uses HVE")
+    parser.add_argument("--bitrate", type=float, default=100_000.0, help="Wireless bitrate in bit/s")
+    parser.add_argument("--coap-block", type=int, default=512, help="CoAP block payload in bytes")
+    parser.add_argument("--hops", type=int, default=1, help="Number of radio hops")
+    parser.add_argument("--retransmission-factor", type=float, default=1.0, help="Mean transmissions per frame")
+    parser.add_argument("--envelope-overhead", type=int, default=0, help="Metadata/tag bytes beyond both ciphertexts")
+    parser.add_argument("--plain-bytes", type=int, default=0, help="Authenticated non-sensitive report size")
+    parser.add_argument("--mcu-latency-ms", type=float, default=68.25)
+    parser.add_argument("--mcu-energy-mj", type=float, default=1.522)
+    parser.add_argument("--json", type=Path, help="Optional JSON output path")
+    parser.add_argument("--csv", type=Path, help="Optional certified-profile CSV output path")
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    crypto = CryptoConfig(envelope_overhead_bytes=args.envelope_overhead)
+    net = NetworkConfig(
+        bitrate_bps=args.bitrate,
+        coap_block_payload_bytes=args.coap_block,
+        hop_count=args.hops,
+        retransmission_factor=args.retransmission_factor,
+    )
+    load = WorkloadConfig(
+        sensitive_path_probability=args.p_sens,
+        mcu_latency_ms=args.mcu_latency_ms,
+        mcu_energy_mj=args.mcu_energy_mj,
+        plain_envelope_bytes=args.plain_bytes,
+    )
+    result = evaluate(crypto, net, load)
+    print_report(result)
+
+    if args.json:
+        args.json.parent.mkdir(parents=True, exist_ok=True)
+        args.json.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    if args.csv:
+        args.csv.parent.mkdir(parents=True, exist_ok=True)
+        write_csv(args.csv, result)
+
+
+if __name__ == "__main__":
+    main()
